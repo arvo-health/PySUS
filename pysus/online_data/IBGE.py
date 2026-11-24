@@ -3,15 +3,17 @@ Helper functions to download official statistics from IBGE SIDRA
 """
 
 import ssl  # Builtin
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
 from urllib.error import HTTPError
-from zipfile import ZipFile
+from zipfile import ZipFile, ZipInfo
 
 import pandas as pd
 import requests
 import urllib3
+from pysus.data import dbc_bytes_to_dbf
 from pysus.data.local import ParquetSet
 from pysus.ftp.databases.ibge_datasus import IBGEDATASUS
 
@@ -19,6 +21,12 @@ from pysus.ftp.databases.ibge_datasus import IBGEDATASUS
 
 
 APIBASE = "https://servicodados.ibge.gov.br/api/v3/"
+
+# Limits for the table inside a population zip downloaded by get_population.
+# The archive comes over anonymous, unauthenticated FTP, so a member that
+# declares or decompresses to more than this is refused instead of loaded.
+MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 50
 
 ibge = IBGEDATASUS().load()
 
@@ -379,6 +387,8 @@ def get_population(
         "IDOSO": População de pessoas com 65 anos ou mais
         "RENDA": População de pessoas de acordo com a renda familiar
     :return: DataFrame with population data
+    :raises ValueError: if the zip's table is above MAX_UNCOMPRESSED_BYTES
+        uncompressed or above MAX_COMPRESSION_RATIO compressed
     """
 
     files = ibge.get_files(year=int(year), source=source)
@@ -407,16 +417,68 @@ def get_population(
         raise NotImplementedError(f"Unkown file type '{file.suffix}'")
 
 
+def _read_zip_member(zip_file: ZipFile, member: ZipInfo) -> bytes:
+    """
+    Reads the data member of a population zip, refusing it before any byte
+    is decompressed if its declared uncompressed size is above
+    MAX_UNCOMPRESSED_BYTES or its declared compression ratio is above
+    MAX_COMPRESSION_RATIO, and stopping as soon as the bytes actually read
+    pass MAX_UNCOMPRESSED_BYTES
+    """
+    if member.file_size > MAX_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"{member.filename} uncompressed size {member.file_size} exceeds "
+            f"{MAX_UNCOMPRESSED_BYTES} bytes"
+        )
+    ratio = member.file_size / max(member.compress_size, 1)
+    if ratio > MAX_COMPRESSION_RATIO:
+        raise ValueError(
+            f"{member.filename} compression ratio {ratio:.0f} exceeds "
+            f"{MAX_COMPRESSION_RATIO}"
+        )
+
+    data = bytearray()
+    with zip_file.open(member) as stream:
+        while True:
+            chunk = stream.read(
+                min(64 * 1024, MAX_UNCOMPRESSED_BYTES + 1 - len(data))
+            )
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_UNCOMPRESSED_BYTES:
+                raise ValueError(
+                    f"{member.filename} exceeds {MAX_UNCOMPRESSED_BYTES} "
+                    "bytes when decompressed"
+                )
+    return bytes(data)
+
+
 def _unzip_to_dataframe(file: str) -> pd.DataFrame:
-    zip_file = ZipFile(file)  # pyright: ignore
+    with ZipFile(file) as zip_file:  # pyright: ignore
+        member = next(
+            (
+                info
+                for info in zip_file.infolist()
+                if not info.is_dir()
+                and info.filename.lower().endswith((".csv", ".dbf", ".dbc"))
+            ),
+            None,
+        )
+        if member is None:
+            raise ValueError(f"No data found in {zip_file}")
+        data = _read_zip_member(zip_file, member)
+
+    name = Path(member.filename)
+    suffix = name.suffix.lower()
+
+    if suffix == ".csv":
+        return pd.read_csv(BytesIO(data))
+
+    if suffix == ".dbc":
+        data = dbc_bytes_to_dbf(data, MAX_UNCOMPRESSED_BYTES)
+
     with TemporaryDirectory() as tempdir:
-        for file in zip_file.namelist():
-            if file.lower().endswith(".csv"):
-                return pd.read_csv(zip_file.extract(file, tempdir))
-
-            if file.lower().endswith((".dbf", ".dbc")):
-                return ParquetSet(
-                    zip_file.extract(file, tempdir)
-                ).to_dataframe()
-
-        raise ValueError(f"No data found in {zip_file}")
+        dbf = Path(tempdir) / f"{name.stem}.dbf"
+        dbf.write_bytes(data)
+        return ParquetSet(str(dbf)).to_dataframe()
